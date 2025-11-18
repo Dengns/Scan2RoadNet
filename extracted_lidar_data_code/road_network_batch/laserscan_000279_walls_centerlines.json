@@ -1,0 +1,32 @@
+{
+  "centerlines": [
+    {
+      "id": 0,
+      "p1": [
+        -2.7881112605677165,
+        0.7121567682172514
+      ],
+      "p2": [
+        4.75354506381986,
+        -1.1715061991496063
+      ],
+      "width": 1.7383574961236956,
+      "length": 7.773336882562369,
+      "wall_pair": [
+        0,
+        1
+      ]
+    }
+  ],
+  "metadata": {
+    "input_file": "/home/qzl/Main/MobiMind/test/test_online_road/extracted_lidar_data_code/wall_batch/laserscan_000279_walls.json",
+    "num_centerlines": 1,
+    "num_walls": 2,
+    "params": {
+      "max_road_width": 3.0,
+      "min_road_width": 0.8,
+      "parallel_angle_thresh": 10,
+      "min_overlap_ratio": 0.3
+    }
+  }
+}

@@ -72,7 +72,7 @@ def extend_line(p1, p2, length=5.0):
 
     return p1_extended, p2_extended
 
-frame_idx = "180"
+frame_idx = "136"
 
 # 加载墙体数据
 wall_path = f"extracted_lidar_data_code/wall_batch/laserscan_000{frame_idx}_walls.json"

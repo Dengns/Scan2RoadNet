@@ -44,6 +44,7 @@ with open(centerline_path, "r") as f:
 
 centerlines = centerlines_info["centerlines"]
 
+
 # Todo: need to fine the current centerline
 centerline = centerlines[0]
 
