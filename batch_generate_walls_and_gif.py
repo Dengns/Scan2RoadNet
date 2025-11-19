@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-批量处理雷达数据，生成墙体检测gif动画
+批量处理雷达数据，生成墙体检测可视化图片
 - 读取目标路径所有雷达数据
-- 生成图6的gif（最终墙体可视化）
+- 为每个文件生成可视化图片（RDP分割 + 最终墙体）
 - 为每个文件生成wall JSON文件
+- 使用改进的DBSCAN聚类算法（角度wrap + 距离自适应）
 """
 
 import numpy as np
@@ -15,14 +16,14 @@ from pathlib import Path
 from typing import List, Tuple, Dict, Optional
 import time
 from tqdm import tqdm
-import imageio
+from functools import partial
 
 
 # =========================
 # 全局可配置参数（重要变量）
 # =========================
 # 输入目录
-INPUT_DIR = "/home/qzl/test_road/test_online_road/extracted_lidar_data_code/extracted_lidar_data/laserscan_json2"
+INPUT_DIR = "/home/qzl/test_road/test_online_road/extracted_lidar_data_code/extracted_lidar_data/laserscan_json"
 # LaserScan 最大量程（米），None 表示不裁剪
 MAX_RANGE = 50.0
 # NPY 模式下的 Z 高度过滤（米）
@@ -36,8 +37,9 @@ JUMP_DIST_THRESH = 0.2      # Jump-distance阈值（米）
 MIN_SEGMENT_POINTS = 8       # 最少点数
 
 # ===== RDP算法参数 =====
-RDP_EPSILON = 0.05   # 最大允许偏差（米）
-MIN_SPLIT_POINTS = 6         # RDP分割后子段最少点数
+RDP_EPSILON = 0.03   # 最大允许偏差（米）
+MIN_SPLIT_POINTS = 3         # RDP分割后子段最少点数
+MIN_RDP_SEGMENT_LENGTH = 0.3  # RDP分割后子段最小长度（米）
 
 # ===== PCA拟合过滤参数 =====
 WALL_RMSE_THRESH = 0.07      # 线段RMSE阈值（米）
@@ -47,20 +49,16 @@ MIN_SEGMENT_LENGTH = 0.5      # 最短线段长度（米）- 允许保留短片�
 PARAM_DBSCAN_EPS = 0.3       # (θ, ρ)空间的聚类半径（主要控制ρ距离，单位：米）
 PARAM_DBSCAN_MIN_SAMPLES = 1 # 最少线段数形成墙体
 ALPHA_SCALE = 0.30             # θ的缩放系数（缩小角度以让eps主要控制距离） 0.3米对应约5.7度
+BETA_SCALE = 0.3      # rho的动态阈值系数
 
 # ===== 1D区间合并参数 =====
-GAP_THRESH = 2             # 允许的小gap（米），用于合并门洞、遮挡
+GAP_THRESH = 1.5             # 允许的小gap（米），用于合并门洞、遮挡
 MIN_WALL_LENGTH = 0.8       # 最短墙体长度（米）
 MIN_SEGMENTS_PER_WALL = 1    # 每面墙最少线段数
 
 # ===== 输出目录 =====
-OUT_DIR = "/home/qzl/Main/MobiMind/test/test_online_road/extracted_lidar_data_code/extracted_lidar_data/RDP_DBSCAN_scan_batch"
-WALL_OUT_DIR = "/home/qzl/Main/MobiMind/test/test_online_road/extracted_lidar_data_code/wall_batch"
-GIF_OUTPUT = "/home/qzl/Main/MobiMind/test/test_online_road/extracted_lidar_data_code/walls_animation.gif"
-
-# GIF参数
-GIF_FPS = 10  # 帧率
-GIF_DURATION = 0.1  # 每帧持续时间（秒）
+IMAGES_OUT_DIR = os.path.join(os.path.dirname(__file__), "extracted_lidar_data_code", "extracted_lidar_data", "RDP_DBSCAN_scan_batch")
+WALL_OUT_DIR = os.path.join(os.path.dirname(__file__), "extracted_lidar_data_code", "wall_batch")
 
 
 # =========================================================================
@@ -187,7 +185,7 @@ def _rdp_recursive(points: np.ndarray,
         _rdp_recursive(points, max_idx, end, eps, keep_idx)
 
 
-def _rdp(points: np.ndarray, eps: float) -> np.ndarray:
+def _rdp(points: np.ndarray, eps: float, min_points: int) -> np.ndarray:
     """Ramer-Douglas-Peucker 算法主函数"""
     n = len(points)
     if n <= 2:
@@ -200,31 +198,85 @@ def _rdp(points: np.ndarray, eps: float) -> np.ndarray:
 
 def _split_by_rdp(points_ordered: np.ndarray,
                   eps: float,
-                  min_points: int) -> list[np.ndarray]:
+                  min_points: int,
+                  min_length: float = 0.0) -> list[np.ndarray]:
     """使用 RDP 算法对一段有序点进行分割"""
     if len(points_ordered) < 2:
         return []
-    key_idx = _rdp(points_ordered, eps)
+    key_idx = _rdp(points_ordered, eps, min_points)
     segments = []
     for i in range(len(key_idx) - 1):
         s = key_idx[i]
         e = key_idx[i + 1]
         seg_points = points_ordered[s:e+1]
-        if len(seg_points) >= min_points:
-            segments.append(seg_points)
+
+        # 过滤条件1：点数太少
+        if len(seg_points) < min_points:
+            continue
+
+        # 过滤条件2：线段太短（如果指定了min_length）
+        if min_length > 0:
+            seg_length = np.linalg.norm(seg_points[-1] - seg_points[0])
+            if seg_length < min_length:
+                continue
+
+        segments.append(seg_points)
     return segments
 
 
+def angle_diff_undirected(a: float, b: float) -> float:
+    """计算无向直线的角度差，范围 [-π/2, π/2]"""
+    d = a - b
+    d = (d + 0.5 * np.pi) % np.pi - 0.5 * np.pi
+    return d
+
+
+def seg_metric(u: np.ndarray, v: np.ndarray, theta_scale: float = 0.3, k_rho: float = 0.3) -> float:
+    """自定义线段距离度量（带角度wrap和距离自适应）"""
+    theta_u, rho_u, r_u = u[0], u[1], u[2]
+    theta_v, rho_v, r_v = v[0], v[1], v[2]
+
+    # ----- 角度部分：带 wrap -----
+    dtheta = angle_diff_undirected(theta_u, theta_v)
+    dtheta_norm = dtheta / theta_scale
+
+    # ----- rho 部分：动态阈值 T(r) = k_rho * r -----
+    drho = rho_u - rho_v
+    r_bar = 0.5 * (r_u + r_v) + 1e-3
+    T_r = k_rho * r_bar
+    drho_norm = drho / T_r
+
+    # 综合距离（欧氏距离）
+    return np.sqrt(dtheta_norm**2 + drho_norm**2)
+
+
 def _segment_to_hessian(p1: np.ndarray, p2: np.ndarray) -> tuple[float, float]:
-    """将线段转换为Hessian法线形式 (θ, ρ)"""
+    """将线段转换为Hessian法线形式 (θ, ρ)（修复版）"""
+    # 中点
     m = 0.5 * (p1 + p2)
+
+    # 方向向量
     d = p2 - p1
-    dx, dy = d[0], d[1]
-    theta = np.arctan2(dy, dx)
+
+    # 法向量（逆时针旋转90度）：方向(dx, dy) → 法向(-dy, dx)
+    nx = -d[1]
+    ny = d[0]
+    norm = np.sqrt(nx**2 + ny**2) + 1e-12
+    nx /= norm
+    ny /= norm
+
+    # 原点到直线的有符号距离
+    rho = nx * m[0] + ny * m[1]
+
+    # 法向量的角度
+    theta = np.arctan2(ny, nx)
+
+    # 归一化到 [0, π)（因为直线无方向性）
+    # 如果 theta < 0，加 π，同时翻转 rho 符号（因为法向量反向了）
     if theta < 0:
         theta += np.pi
-    n = np.array([-np.sin(theta), np.cos(theta)])
-    rho = np.dot(n, m)
+        rho = -rho
+
     return float(theta), float(rho)
 
 
@@ -249,23 +301,43 @@ def _merge_intervals_1d(intervals: list[tuple[float, float]],
 def _cluster_segments_in_param_space(fitted_segments: list[dict],
                                      eps: float,
                                      min_samples: int,
-                                     alpha: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """在 (θ, ρ) 参数空间对线段进行DBSCAN聚类"""
+                                     alpha: float,
+                                     beta: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """在 (θ, ρ, r) 参数空间对线段进行DBSCAN聚类（带角度wrap和距离自适应）"""
     if len(fitted_segments) == 0:
         return np.array([]), np.array([]), np.array([])
+
+    # 预分配数组
     n_segs = len(fitted_segments)
-    features = np.zeros((n_segs, 2), dtype=np.float64)
+    features = np.zeros((n_segs, 3), dtype=np.float64)  # 现在是3维：[theta, rho, r]
     weights = np.zeros(n_segs, dtype=np.float64)
+
+    # 向量化处理所有线段
     for i, seg_dict in enumerate(fitted_segments):
         fit = seg_dict['fit']
         p1 = fit['p1']
         p2 = fit['p2']
+
+        # 转换到 (θ, ρ) 空间
         theta, rho = _segment_to_hessian(p1, p2)
-        features[i, 0] = theta / alpha
+
+        # 计算线段中点到原点的距离
+        midpoint = 0.5 * (p1 + p2)
+        r = np.linalg.norm(midpoint)
+
+        # 特征：[theta, rho, r]（注意：theta不除以alpha，alpha传递给metric）
+        features[i, 0] = theta
         features[i, 1] = rho
+        features[i, 2] = r
         weights[i] = fit['length']
-    db = DBSCAN(eps=eps, min_samples=min_samples).fit(features)
+
+    # 使用自定义metric进行DBSCAN聚类
+    # 将alpha和k_rho参数固化到metric函数中
+    metric_fn = partial(seg_metric, theta_scale=alpha, k_rho=beta)
+
+    db = DBSCAN(eps=eps, min_samples=min_samples, metric=metric_fn).fit(features)
     labels = db.labels_
+
     return features, weights, labels
 
 
@@ -374,7 +446,8 @@ def process_single_file(input_path: str) -> Tuple[np.ndarray, List[np.ndarray], 
     split_segments_points = []
     for seg in segments_points:
         split_segments_points.extend(
-            _split_by_rdp(seg, eps=RDP_EPSILON, min_points=MIN_SPLIT_POINTS)
+            _split_by_rdp(seg, eps=RDP_EPSILON, min_points=MIN_SPLIT_POINTS,
+                         min_length=MIN_RDP_SEGMENT_LENGTH)
         )
 
     # PCA拟合
@@ -395,7 +468,8 @@ def process_single_file(input_path: str) -> Tuple[np.ndarray, List[np.ndarray], 
             fitted_segments,
             eps=PARAM_DBSCAN_EPS,
             min_samples=PARAM_DBSCAN_MIN_SAMPLES,
-            alpha=ALPHA_SCALE
+            alpha=ALPHA_SCALE,
+            beta=BETA_SCALE
         )
 
         merged_walls = []
@@ -416,13 +490,13 @@ def process_single_file(input_path: str) -> Tuple[np.ndarray, List[np.ndarray], 
     return xy, split_segments_points, fitted_segments
 
 
-def plot_wall_frame(xy: np.ndarray, split_segments_points: List[np.ndarray],
-                    fitted_segments: List[dict], frame_idx: int) -> np.ndarray:
+def save_wall_visualization(xy: np.ndarray, split_segments_points: List[np.ndarray],
+                           fitted_segments: List[dict], frame_idx: int, output_path: str):
     """
-    生成单帧1x2可视化图像（图3+图6）
+    生成并保存单帧1x2可视化图像（图3+图6）
 
-    返回:
-        image: RGB图像数组 (H, W, 3)
+    参数:
+        output_path: 输出图片路径
     """
     fig, (ax3, ax6) = plt.subplots(1, 2, figsize=(20, 10), dpi=100)
 
@@ -465,14 +539,10 @@ def plot_wall_frame(xy: np.ndarray, split_segments_points: List[np.ndarray],
     ax6.set_xlim(-8, 8)
     ax6.set_ylim(-8, 8)
 
-    # 转换为图像数组
+    # 保存图片
     plt.tight_layout()
-    fig.canvas.draw()
-    image = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
-    image = image.reshape(fig.canvas.get_width_height()[::-1] + (3,))
-
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
-    return image
 
 
 def save_wall_json(fitted_segments: List[dict], input_path: str, output_dir: str):
@@ -516,13 +586,13 @@ def save_wall_json(fitted_segments: List[dict], input_path: str, output_dir: str
 # =========================================================================
 
 def main():
-    """批量处理所有雷达数据，生成gif和wall文件"""
+    """批量处理所有雷达数据，生成可视化图片和wall文件"""
     print("="*70)
-    print(" 批量墙体检测与GIF生成")
+    print(" 批量墙体检测与可视化")
     print("="*70)
 
     # 创建输出目录
-    os.makedirs(OUT_DIR, exist_ok=True)
+    os.makedirs(IMAGES_OUT_DIR, exist_ok=True)
     os.makedirs(WALL_OUT_DIR, exist_ok=True)
 
     # 获取所有输入文件
@@ -534,7 +604,7 @@ def main():
         return
 
     # 批量处理
-    frames = []
+    success_count = 0
     total_start = time.time()
 
     for idx, input_path in enumerate(tqdm(input_files, desc="处理文件")):
@@ -542,12 +612,15 @@ def main():
             # 处理单个文件
             xy, split_segments_points, fitted_segments = process_single_file(str(input_path))
 
-            # 生成可视化图像
-            image = plot_wall_frame(xy, split_segments_points, fitted_segments, idx)
-            frames.append(image)
+            # 生成并保存可视化图像
+            basename = os.path.splitext(input_path.name)[0]
+            output_image_path = os.path.join(IMAGES_OUT_DIR, f"{basename}_visualization.png")
+            save_wall_visualization(xy, split_segments_points, fitted_segments, idx, output_image_path)
 
             # 保存墙体JSON
             save_wall_json(fitted_segments, str(input_path), WALL_OUT_DIR)
+
+            success_count += 1
 
         except Exception as e:
             print(f"\n警告：处理文件 {input_path.name} 时出错: {e}")
@@ -555,24 +628,17 @@ def main():
 
     total_time = time.time() - total_start
 
-    # 生成GIF
-    if len(frames) > 0:
-        print(f"\n生成GIF动画...")
-        imageio.mimsave(GIF_OUTPUT, frames, fps=GIF_FPS, loop=0)
-        print(f"✅ GIF已保存: {GIF_OUTPUT}")
-    else:
-        print("错误：没有生成任何帧！")
-
     # 统计信息
     print("\n" + "="*70)
     print(" 处理完成统计")
     print("="*70)
     print(f"总文件数: {len(input_files)}")
-    print(f"成功处理: {len(frames)}")
+    print(f"成功处理: {success_count}")
     print(f"总耗时: {total_time:.2f}s")
-    print(f"平均速度: {len(frames)/total_time:.2f} FPS")
+    if success_count > 0:
+        print(f"平均速度: {success_count/total_time:.2f} 文件/秒")
     print(f"\n输出位置:")
-    print(f"  - GIF动画: {GIF_OUTPUT}")
+    print(f"  - 可视化图片: {IMAGES_OUT_DIR}/")
     print(f"  - 墙体JSON: {WALL_OUT_DIR}/")
     print("="*70)
 

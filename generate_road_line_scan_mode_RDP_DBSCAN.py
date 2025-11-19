@@ -9,6 +9,7 @@ from sklearn.cluster import DBSCAN
 import os
 import time
 import json
+from functools import partial
 
 
 
@@ -16,7 +17,7 @@ import json
 # 全局可配置参数（重要变量）
 # =========================
 # 输入文件（支持 LaserScan JSON 或 NPY）
-INPUT_PATH = os.path.join(os.path.dirname(__file__), "extracted_lidar_data_code", "extracted_lidar_data", "laserscan_json", "laserscan_000136.json")
+INPUT_PATH = os.path.join(os.path.dirname(__file__), "extracted_lidar_data_code", "extracted_lidar_data", "laserscan_json", "laserscan_000165.json")
 # LaserScan 最大量程（米），None 表示不裁剪
 MAX_RANGE = 50.0
 # NPY 模式下的 Z 高度过滤（米）
@@ -30,8 +31,9 @@ JUMP_DIST_THRESH = 0.2      # Jump-distance阈值（米）
 MIN_SEGMENT_POINTS = 8       # 最少点数
 
 # ===== RDP算法参数 =====
-RDP_EPSILON = 0.05   # 最大允许偏差（米）
-MIN_SPLIT_POINTS = 6         # RDP分割后子段最少点数
+RDP_EPSILON = 0.03   # 最大允许偏差（米）
+MIN_SPLIT_POINTS = 3         # RDP分割后子段最少点数
+MIN_RDP_SEGMENT_LENGTH = 0.3  # RDP分割后子段最小长度（米）
 
 # ===== PCA拟合过滤参数 =====
 WALL_RMSE_THRESH = 0.07      # 线段RMSE阈值（米）
@@ -40,7 +42,8 @@ MIN_SEGMENT_LENGTH = 0.5      # 最短线段长度（米）- 允许保留短片�
 # ===== 参数空间DBSCAN墙体聚类参数 =====
 PARAM_DBSCAN_EPS = 0.3       # (θ, ρ)空间的聚类半径（主要控制ρ距离，单位：米）
 PARAM_DBSCAN_MIN_SAMPLES = 1 # 最少线段数形成墙体
-ALPHA_SCALE = 0.30             # θ的缩放系数（缩小角度以让eps主要控制距离） 0.3米对应约5.7度
+ALPHA_SCALE = 0.3           # θ的缩放系数（缩小角度以让eps主要控制距离） 0.3米对应约5.7度
+BETA_SCALE = 0.3      # rho的动态阈值系数
 
 # ===== 1D区间合并参数 =====
 GAP_THRESH = 2             # 允许的小gap（米），用于合并门洞、遮挡
@@ -233,7 +236,7 @@ def _rdp_recursive(points: np.ndarray,
         _rdp_recursive(points, max_idx, end, eps, keep_idx)
 
 
-def _rdp(points: np.ndarray, eps: float) -> np.ndarray:
+def _rdp(points: np.ndarray, eps: float, min_points: int) -> np.ndarray:
     """
     Ramer-Douglas-Peucker 算法主函数
 
@@ -261,7 +264,8 @@ def _rdp(points: np.ndarray, eps: float) -> np.ndarray:
 
 def _split_by_rdp(points_ordered: np.ndarray,
                   eps: float,
-                  min_points: int) -> list[np.ndarray]:
+                  min_points: int,
+                  min_length: float = 0.0) -> list[np.ndarray]:
     """
     使用 RDP 算法对一段有序点进行分割
 
@@ -269,6 +273,7 @@ def _split_by_rdp(points_ordered: np.ndarray,
         points_ordered: N×2 有序点数组
         eps: RDP 偏差阈值（米）
         min_points: 每段最少点数
+        min_length: 每段最小长度（米），默认0表示不限制
 
     返回:
         线段列表，每个线段是一个点数组
@@ -277,7 +282,7 @@ def _split_by_rdp(points_ordered: np.ndarray,
         return []
 
     # 运行 RDP 获取关键点索引
-    key_idx = _rdp(points_ordered, eps)
+    key_idx = _rdp(points_ordered, eps, min_points)
 
     # 将相邻关键点之间的点组成线段
     segments = []
@@ -286,13 +291,71 @@ def _split_by_rdp(points_ordered: np.ndarray,
         e = key_idx[i + 1]
         seg_points = points_ordered[s:e+1]
 
-        # 过滤掉点数太少的段
-        if len(seg_points) >= min_points:
-            segments.append(seg_points)
+        # 过滤条件1：点数太少
+        if len(seg_points) < min_points:
+            continue
+
+        # 过滤条件2：线段太短（如果指定了min_length）
+        if min_length > 0:
+            seg_length = np.linalg.norm(seg_points[-1] - seg_points[0])
+            if seg_length < min_length:
+                continue
+
+        segments.append(seg_points)
 
     return segments
 
 # ===== 参数空间DBSCAN墙体聚类方法 =====
+
+def angle_diff_undirected(a: float, b: float) -> float:
+    """
+    计算无向直线的角度差，范围 [-π/2, π/2]
+
+    因为直线没有方向性，所以角度差应该在 [-π/2, π/2] 范围内
+
+    参数:
+        a, b: 两个角度（弧度）
+
+    返回:
+        角度差（弧度），范围 [-π/2, π/2]
+    """
+    d = a - b
+    d = (d + 0.5 * np.pi) % np.pi - 0.5 * np.pi
+    return d
+
+
+def seg_metric(u: np.ndarray, v: np.ndarray, theta_scale: float = 0.3, k_rho: float = 0.14) -> float:
+    """
+    自定义线段距离度量（带角度wrap和距离自适应）
+
+    参数:
+        u, v: 形如 [theta, rho, r] 的一维数组
+            theta: 角度（弧度）
+            rho: Hessian距离参数
+            r: 线段中点到原点的距离
+        theta_scale: θ的缩放系数（类似于原来的alpha）
+        k_rho: rho的动态阈值系数
+
+    返回:
+        归一化后的综合距离
+    """
+    theta_u, rho_u, r_u = u
+    theta_v, rho_v, r_v = v
+
+    # ----- 角度部分：带 wrap -----
+    dtheta = angle_diff_undirected(theta_u, theta_v)
+    dtheta_norm = dtheta / theta_scale
+
+    # ----- rho 部分：动态阈值 T(r) = k_rho * r -----
+    drho = rho_u - rho_v
+    r_bar = 0.5 * (r_u + r_v) + 1e-3  # 平均距离，避免除零
+    T_r = k_rho * r_bar  # 动态阈值：距离越远，允许的rho偏差越大
+    drho_norm = drho / T_r
+
+    # 综合距离（欧氏距离）
+    return np.sqrt(dtheta_norm**2 + drho_norm**2)
+
+
 def _segment_to_hessian(p1: np.ndarray, p2: np.ndarray) -> tuple[float, float]:
     """
     将线段转换为Hessian法线形式 (θ, ρ)
@@ -303,27 +366,32 @@ def _segment_to_hessian(p1: np.ndarray, p2: np.ndarray) -> tuple[float, float]:
     返回:
         (theta, rho):
             theta ∈ [0, π) - 法向量的角度
-            rho - 原点到直线的有符号距离
+            rho - 原点到直线的有符号距离（可正可负）
     """
     # 中点
     m = 0.5 * (p1 + p2)
 
     # 方向向量
     d = p2 - p1
-    dx, dy = d[0], d[1]
 
-    # 计算方向角 θ ∈ [-π, π]
-    theta = np.arctan2(dy, dx)
-
-    # 归一化到 [0, π)（因为直线无方向性）
-    if theta < 0:
-        theta += np.pi
-
-    # 法向量（垂直于方向向量）
-    n = np.array([-np.sin(theta), np.cos(theta)])
+    # 法向量（逆时针旋转90度）：方向(dx, dy) → 法向(-dy, dx)
+    nx = -d[1]
+    ny = d[0]
+    norm = np.sqrt(nx**2 + ny**2) + 1e-12
+    nx /= norm
+    ny /= norm
 
     # 原点到直线的有符号距离
-    rho = np.dot(n, m)
+    rho = nx * m[0] + ny * m[1]
+
+    # 法向量的角度
+    theta = np.arctan2(ny, nx)
+
+    # 归一化到 [0, π)（因为直线无方向性）
+    # 如果 theta < 0，加 π，同时翻转 rho 符号（因为法向量反向了）
+    if theta < 0:
+        theta += np.pi
+        rho = -rho
 
     return float(theta), float(rho)
 
@@ -368,19 +436,20 @@ def _merge_intervals_1d(intervals: list[tuple[float, float]],
 def _cluster_segments_in_param_space(fitted_segments: list[dict],
                                      eps: float,
                                      min_samples: int,
-                                     alpha: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+                                     alpha: float,
+                                     beta: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    在 (θ, ρ) 参数空间对线段进行DBSCAN聚类（优化版）
+    在 (θ, ρ, r) 参数空间对线段进行DBSCAN聚类（带角度wrap和距离自适应）
 
     参数:
         fitted_segments: 线段列表，每个元素是 {'fit': fit_dict, 'points': points}
-        eps: DBSCAN邻域半径（主要控制ρ的距离，单位：米）
+        eps: DBSCAN邻域半径（对归一化后的综合距离的阈值）
         min_samples: DBSCAN最小样本数
-        alpha: θ的缩放系数（缩小角度）
+        alpha: θ的缩放系数（传递给自定义metric）
 
     返回:
         (features, weights, labels):
-            features: N×2 数组 [[theta/alpha, rho], ...]
+            features: N×3 数组 [[theta, rho, r], ...]
             weights: N 数组，线段长度（可用于加权平均）
             labels: DBSCAN聚类标签
     """
@@ -389,7 +458,7 @@ def _cluster_segments_in_param_space(fitted_segments: list[dict],
 
     # 预分配数组以避免动态列表增长
     n_segs = len(fitted_segments)
-    features = np.zeros((n_segs, 2), dtype=np.float64)
+    features = np.zeros((n_segs, 3), dtype=np.float64)  # 现在是3维：[theta, rho, r]
     weights = np.zeros(n_segs, dtype=np.float64)
 
     # 向量化处理所有线段
@@ -401,13 +470,21 @@ def _cluster_segments_in_param_space(fitted_segments: list[dict],
         # 转换到 (θ, ρ) 空间
         theta, rho = _segment_to_hessian(p1, p2)
 
-        # 缩小theta以让eps主要控制rho（距离）
-        features[i, 0] = theta / alpha
+        # 计算线段中点到原点的距离
+        midpoint = 0.5 * (p1 + p2)
+        r = np.linalg.norm(midpoint)
+
+        # 特征：[theta, rho, r]（注意：theta不除以alpha，alpha传递给metric）
+        features[i, 0] = theta
         features[i, 1] = rho
+        features[i, 2] = r
         weights[i] = fit['length']
 
-    # 在参数空间进行DBSCAN聚类
-    db = DBSCAN(eps=eps, min_samples=min_samples).fit(features)
+    # 使用自定义metric进行DBSCAN聚类
+    # 将alpha和k_rho参数固化到metric函数中
+    metric_fn = partial(seg_metric, theta_scale=alpha, k_rho=beta)
+
+    db = DBSCAN(eps=eps, min_samples=min_samples, metric=metric_fn).fit(features)
     labels = db.labels_
 
     return features, weights, labels
@@ -568,7 +645,8 @@ t_rdp_start = time.perf_counter()
 split_segments_points = []
 for seg in segments_points:
     split_segments_points.extend(
-        _split_by_rdp(seg, eps=RDP_EPSILON, min_points=MIN_SPLIT_POINTS)
+        _split_by_rdp(seg, eps=RDP_EPSILON, min_points=MIN_SPLIT_POINTS,
+                     min_length=MIN_RDP_SEGMENT_LENGTH)
     )
 t_rdp_end = time.perf_counter()
 
@@ -602,7 +680,8 @@ if len(fitted_segments) > 0:
         fitted_segments,
         eps=PARAM_DBSCAN_EPS,
         min_samples=PARAM_DBSCAN_MIN_SAMPLES,
-        alpha=ALPHA_SCALE
+        alpha=ALPHA_SCALE,
+        beta=BETA_SCALE
     )
     t_param_dbscan_end = time.perf_counter()
 
@@ -673,7 +752,7 @@ for k, seg in enumerate(split_segments_points):
 ax3.set_title(f"RDP segments (N={len(split_segments_points)}, ε={RDP_EPSILON}m)", fontsize=12, fontweight='bold')
 ax3.set_xlabel("X (m)"); ax3.set_ylabel("Y (m)"); ax3.axis('equal'); ax3.grid(True, linestyle=':', alpha=0.4)
 
-# ===== Ax4: 参数空间(θ, ρ)聚类可视化 =====
+# ===== Ax4: 参数空间(θ, ρ)聚类可视化（增强版：点编号 + 连接线 + 距离标注）=====
 if 'features' in locals() and len(features) > 0:
     # 绘制参数空间中的点（所有初步拟合的线段）
     noise_mask = (labels == -1)
@@ -681,28 +760,165 @@ if 'features' in locals() and len(features) > 0:
 
     # 噪声点（灰色×）
     if np.any(noise_mask):
-        ax4.scatter(features[noise_mask, 0], features[noise_mask, 1],
+        noise_indices = np.where(noise_mask)[0]
+        ax4.scatter(features[noise_mask, 0] / ALPHA_SCALE, features[noise_mask, 1],
                    c='gray', s=80, alpha=0.6, marker='x', linewidths=2,
                    label=f'Noise ({np.sum(noise_mask)})')
 
-    # 聚类点（按簇着色，大圆点）
+        # 标注噪声点的编号
+        for idx in noise_indices:
+            x = features[idx, 0] / ALPHA_SCALE
+            y = features[idx, 1]
+            ax4.text(x, y, f'{idx}', fontsize=8, ha='left', va='bottom',
+                    color='gray', fontweight='bold')
+
+    # 聚类点（按簇着色）
     if np.any(cluster_mask):
         unique_labels = sorted(set(labels[cluster_mask]))
+
+        # 🔍 先打印特定点对的详细计算（无论是否在同一簇）
+        debug_pairs = [(8, 10), (6, 9)]
+        print("\n" + "="*80)
+        print("🔍 特定点对的距离计算详情")
+        print("="*80)
+
+        for pair in debug_pairs:
+            idx_i, idx_j = pair
+            if idx_i < len(features) and idx_j < len(features):
+                print(f"\n{'='*70}")
+                print(f"🔍 详细计算：线段 #{idx_i} 和 #{idx_j} 之间的距离")
+                print(f"{'='*70}")
+
+                # 提取特征
+                u = features[idx_i]
+                v = features[idx_j]
+                theta_u, rho_u, r_u = u[0], u[1], u[2]
+                theta_v, rho_v, r_v = v[0], v[1], v[2]
+
+                print(f"\n📌 输入特征：")
+                print(f"  线段 #{idx_i}: θ={theta_u:.4f} rad, ρ={rho_u:.4f} m, r={r_u:.4f} m")
+                print(f"  线段 #{idx_j}: θ={theta_v:.4f} rad, ρ={rho_v:.4f} m, r={r_v:.4f} m")
+                print(f"  线段 #{idx_i} 所属簇: {labels[idx_i]}")
+                print(f"  线段 #{idx_j} 所属簇: {labels[idx_j]}")
+
+                print(f"\n📐 步骤1：计算角度差（带wrap）")
+                dtheta_raw = theta_u - theta_v
+                print(f"  原始角度差: {dtheta_raw:.4f} rad")
+                dtheta = angle_diff_undirected(theta_u, theta_v)
+                print(f"  wrap后角度差: {dtheta:.4f} rad  (范围 [-π/2, π/2])")
+                dtheta_norm = dtheta / ALPHA_SCALE
+                print(f"  归一化: {dtheta:.4f} / {ALPHA_SCALE} = {dtheta_norm:.4f}")
+
+                print(f"\n📏 步骤2：计算rho差（动态阈值）")
+                drho = rho_u - rho_v
+                print(f"  原始rho差: {drho:.4f} m")
+                r_bar = 0.5 * (r_u + r_v) + 1e-3
+                print(f"  平均距离: r_bar = 0.5*({r_u:.4f} + {r_v:.4f}) = {r_bar:.4f} m")
+                T_r = BETA_SCALE * r_bar
+                print(f"  动态阈值: T(r) = {BETA_SCALE} * {r_bar:.4f} = {T_r:.4f} m")
+                drho_norm = drho / T_r
+                print(f"  归一化: {drho:.4f} / {T_r:.4f} = {drho_norm:.4f}")
+
+                print(f"\n🎯 步骤3：计算综合距离")
+                dist_squared = dtheta_norm**2 + drho_norm**2
+                dist = np.sqrt(dist_squared)
+                print(f"  d² = ({dtheta_norm:.4f})² + ({drho_norm:.4f})²")
+                print(f"     = {dtheta_norm**2:.4f} + {drho_norm**2:.4f}")
+                print(f"     = {dist_squared:.4f}")
+                print(f"  d = √{dist_squared:.4f} = {dist:.4f}")
+
+                print(f"\n✅ 结果：dist = {dist:.4f}, eps = {PARAM_DBSCAN_EPS:.4f}")
+                if dist < PARAM_DBSCAN_EPS:
+                    print(f"  ✓ 距离 < eps，这两个点应该被聚类在一起")
+                else:
+                    print(f"  ✗ 距离 >= eps，这两个点不会被聚类在一起")
+
+                if labels[idx_i] == labels[idx_j] and labels[idx_i] != -1:
+                    print(f"  ✓ 实际结果：在同一个簇（Cluster {labels[idx_i]}）")
+                elif labels[idx_i] == -1 or labels[idx_j] == -1:
+                    print(f"  ⚠ 实际结果：至少一个是噪声点")
+                else:
+                    print(f"  ✗ 实际结果：不在同一个簇（{idx_i}→C{labels[idx_i]}, {idx_j}→C{labels[idx_j]}）")
+                print(f"{'='*70}\n")
+
+        # 方案4：准备调试表格数据
+        print("\n" + "="*80)
+        print("📊 DBSCAN 聚类详细信息（参数空间）")
+        print("="*80)
+
         for label in unique_labels:
             mask = (labels == label)
+            indices = np.where(mask)[0]
             n_segs = np.sum(mask)
-            color = plt.cm.tab10(label % 10)  # 使用cluster_id本身映射颜色，与Ax5对齐
-            ax4.scatter(features[mask, 0], features[mask, 1],
-                       c=[color], s=100, alpha=0.85,
-                       edgecolors='black', linewidths=1.5,
+            base_color = plt.cm.tab10(label % 10)
+
+            # 提取该簇的特征
+            cluster_features = features[mask]
+            cluster_theta_scaled = cluster_features[:, 0] / ALPHA_SCALE
+            cluster_rho = cluster_features[:, 1]
+            cluster_r = cluster_features[:, 2]
+
+            # 绘制聚类点（按簇着色）
+            ax4.scatter(cluster_theta_scaled, cluster_rho,
+                       c=[base_color], s=150, alpha=0.85,
                        label=f'Cluster {label} ({n_segs} segs)')
 
-    ax4.set_title(f"Param-space (θ, ρ) DBSCAN clustering\n"
-                  f"Total segments: {len(features)}, Clusters: {num_clusters}, Noise: {num_noise}",
-                  fontsize=11, fontweight='bold')
+            # 标注点的编号
+            for i, idx in enumerate(indices):
+                x = cluster_theta_scaled[i]
+                y = cluster_rho[i]
+                ax4.text(x, y, f'{idx}', fontsize=9, ha='center', va='center',
+                        color='white', fontweight='bold')
+
+            # 方案3：绘制连接线（不标注距离）
+            # 只在簇内点数>=2时绘制
+            if n_segs >= 2:
+                for i in range(len(indices)):
+                    for j in range(i+1, len(indices)):
+                        idx_i, idx_j = indices[i], indices[j]
+
+                        # 计算自定义距离
+                        dist = seg_metric(features[idx_i], features[idx_j],
+                                        theta_scale=ALPHA_SCALE, k_rho=BETA_SCALE)
+
+                        # 只绘制距离 < eps 的连接线
+                        if dist < PARAM_DBSCAN_EPS:
+                            x1, y1 = cluster_theta_scaled[i], cluster_rho[i]
+                            x2, y2 = cluster_theta_scaled[j], cluster_rho[j]
+
+                            ax4.plot([x1, x2], [y1, y2],
+                                   color=base_color, linestyle='--', linewidth=1.5, alpha=0.4)
+
+            # 方案4：打印调试表格
+            print(f"\n🔹 Cluster {label} ({n_segs} segments)")
+            print(f"{'Seg#':<6} {'θ(rad)':<10} {'ρ(m)':<10} {'r(m)':<10} {'θ/α':<10}")
+            print("-" * 50)
+            for i, idx in enumerate(indices):
+                theta_raw = features[idx, 0]
+                rho = features[idx, 1]
+                r = features[idx, 2]
+                theta_scaled = theta_raw / ALPHA_SCALE
+                print(f"{idx:<6} {theta_raw:<10.3f} {rho:<10.3f} {r:<10.3f} {theta_scaled:<10.3f}")
+
+            # 计算簇内最大距离
+            max_dist = 0.0
+            for i in range(len(indices)):
+                for j in range(i+1, len(indices)):
+                    dist = seg_metric(features[indices[i]], features[indices[j]],
+                                    theta_scale=ALPHA_SCALE, k_rho=BETA_SCALE)
+                    max_dist = max(max_dist, dist)
+            print(f"\n  📏 簇内最大距离: {max_dist:.3f} (eps={PARAM_DBSCAN_EPS:.3f})")
+
+        print("\n" + "="*80 + "\n")
+
+    ax4.set_title(f"Param-space (θ, ρ) DBSCAN (custom metric)\n"
+                  f"Numbers=segment index, Dash=connections<eps\n"
+                  f"eps={PARAM_DBSCAN_EPS:.2f}, Clusters: {num_clusters}, Noise: {num_noise}",
+                  fontsize=10, fontweight='bold')
     ax4.set_xlabel(f"θ / {ALPHA_SCALE:.2f} (scaled)", fontsize=10)
     ax4.set_ylabel("ρ (m)", fontsize=10)
-    ax4.legend(fontsize=9, loc='best', framealpha=0.9)
+    ax4.legend(fontsize=8, loc='best', framealpha=0.9)
+    ax4.axis('equal')
     ax4.grid(True, linestyle=':', alpha=0.5)
 else:
     ax4.text(0.5, 0.5, 'No segments for clustering',

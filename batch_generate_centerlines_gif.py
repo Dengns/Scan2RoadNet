@@ -26,7 +26,7 @@ WALL_JSON_DIR = "/home/qzl/Main/MobiMind/test/test_online_road/extracted_lidar_d
 
 # 输出目录
 OUT_DIR = "/home/qzl/Main/MobiMind/test/test_online_road/extracted_lidar_data_code/road_network_batch2"
-# GIF_OUTPUT = "/home/qzl/Main/MobiMind/test/test_online_road/extracted_lidar_data_code/centerlines_animation.gif"
+GIF_OUTPUT = "/home/qzl/Main/MobiMind/test/test_online_road/extracted_lidar_data_code/centerlines_animation.gif"
 
 # ===== 道路配对参数 =====
 MAX_ROAD_WIDTH = 3.0        # 最大道路宽度（米）

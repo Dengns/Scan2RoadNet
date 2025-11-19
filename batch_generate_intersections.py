@@ -16,9 +16,9 @@ from tqdm import tqdm
 # =========================
 # 配置参数
 # =========================
-WALL_DIR = "/home/qzl/test_road/test_online_road/extracted_lidar_data_code/wall_batch2"
-CENTERLINE_DIR = "/home/qzl/test_road/test_online_road/extracted_lidar_data_code/road_network_batch2"
-OUTPUT_DIR = "/home/qzl/test_road/test_online_road/extracted_lidar_data_code/intersection_results2"
+WALL_DIR = "/home/qzl/test_road/test_online_road/extracted_lidar_data_code/wall_batch"
+CENTERLINE_DIR = "/home/qzl/test_road/test_online_road/extracted_lidar_data_code/road_network_batch"
+OUTPUT_DIR = "/home/qzl/test_road/test_online_road/extracted_lidar_data_code/intersection_results1V2"
 
 # 延长线长度
 EXTEND_LENGTH = 5.0

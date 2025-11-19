@@ -37,31 +37,31 @@
     {
       "id": 2,
       "p1": [
-        -2.3986829073741793,
-        1.2887966483207218
+        -2.3987742395136213,
+        1.2835914857601252
       ],
       "p2": [
-        3.68725423894431,
-        1.1875553690918474
+        3.687153144214253,
+        1.176870475124789
       ],
-      "length": 6.086779176671283,
+      "length": 6.0868630257399285,
       "direction": [
-        0.9998616624105394,
-        -0.016632980479528357
+        0.9998462850216633,
+        -0.01753300676948556
       ],
-      "rmse": 0.06335992222094858
+      "rmse": 0.05833984190498776
     }
   ],
   "metadata": {
-    "input_file": "/home/qzl/Main/MobiMind/test/test_online_road/extracted_lidar_data_code/extracted_lidar_data/laserscan_json/laserscan_000117.json",
+    "input_file": "/home/qzl/test_road/test_online_road/extracted_lidar_data_code/extracted_lidar_data/laserscan_json/laserscan_000117.json",
     "num_walls": 3,
     "x_limit": 10.0,
     "y_limit": 5.0,
     "params": {
-      "rdp_epsilon": 0.05,
+      "rdp_epsilon": 0.03,
       "wall_rmse_thresh": 0.07,
       "min_wall_length": 0.8,
-      "gap_thresh": 2
+      "gap_thresh": 1.5
     }
   }
 }

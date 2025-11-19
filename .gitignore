@@ -1,0 +1,12 @@
+# 忽略 extracted_lidar_data_code 目录下的所有内容
+extracted_lidar_data_code/*
+
+# 但保留 extracted_lidar_data 目录（允许进入）
+!extracted_lidar_data_code/extracted_lidar_data/
+
+# 忽略 extracted_lidar_data 下的所有内容
+extracted_lidar_data_code/extracted_lidar_data/*
+
+# 但保留这两个文件夹
+!extracted_lidar_data_code/extracted_lidar_data/laserscan_json/
+!extracted_lidar_data_code/extracted_lidar_data/laserscan_json2/
