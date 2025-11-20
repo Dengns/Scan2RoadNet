@@ -7,7 +7,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.cluster import DBSCAN
-from shapely.geometry import LineString, MultiPoint
+from shapely.geometry import LineString, MultiPoint, Point
 import json
 import os
 import sys
@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 # 配置参数
 # =========================
 # 输入文件路径
-INPUT_LASERSCAN_PATH = "extracted_lidar_data_code/extracted_lidar_data/laserscan_json/laserscan_000075.json"
+INPUT_LASERSCAN_PATH = "extracted_lidar_data_code/extracted_lidar_data/laserscan_json2/laserscan_000093.json"
 # 输出目录
 OUTPUT_DIR = "extracted_lidar_data_code/all_in_one_results"
 
@@ -40,18 +40,18 @@ PARAM_DBSCAN_EPS = 0.3
 PARAM_DBSCAN_MIN_SAMPLES = 1
 ALPHA_SCALE = 0.30  # θ的缩放系数
 BETA_SCALE = 0.3    # rho的动态阈值系数
-GAP_THRESH = 1.5
+GAP_THRESH = 1.8
 MIN_WALL_LENGTH = 0.8
-MIN_SEGMENTS_PER_WALL = 1
+MIN_SEGMENTS_PER_WALL = 0.8
 
 # 道路中心线参数
 MAX_ROAD_WIDTH = 3.0
 MIN_ROAD_WIDTH = 0.8
 PARALLEL_ANGLE_THRESH = 10
-MIN_OVERLAP_RATIO = 0.3
+MIN_OVERLAP_LENGTH = 0.5  # 最小重叠长度（米）
 
 # 交叉口识别参数
-EXTEND_LENGTH = 5.0
+EXTEND_LENGTH = 4.0
 
 
 # =========================
@@ -442,7 +442,7 @@ def compute_wall_distance(wall1, wall2):
 
 
 def compute_projection_overlap(wall1, wall2):
-    """计算两面墙的投影重叠度"""
+    """计算两面墙的投影重叠长度（米）"""
     dir_vec = wall1['fit']['dir']
 
     t1_start = np.dot(wall1['fit']['p1'], dir_vec)
@@ -459,11 +459,8 @@ def compute_projection_overlap(wall1, wall2):
     overlap_end = min(t1_end, t2_end)
     overlap_length = max(0, overlap_end - overlap_start)
 
-    min_length = min(t1_end - t1_start, t2_end - t2_start)
-    if min_length < 1e-6:
-        return 0.0
-
-    return overlap_length / min_length
+    # 返回绝对重叠长度（米）
+    return overlap_length
 
 
 def find_wall_pairs(walls):
@@ -489,13 +486,17 @@ def find_wall_pairs(walls):
             if dist < MIN_ROAD_WIDTH or dist > MAX_ROAD_WIDTH:
                 continue
 
-            overlap = compute_projection_overlap(wall1, wall2)
-            if overlap < MIN_OVERLAP_RATIO:
+            # 🔑 改进：检查绝对重叠长度（米），而不是重叠比例
+            overlap_length = compute_projection_overlap(wall1, wall2)
+            if overlap_length < MIN_OVERLAP_LENGTH:
                 continue
 
+            # 计算评分（使用重叠长度参与评分）
             ideal_width = 1.5
             width_score = 1.0 - abs(dist - ideal_width) / MAX_ROAD_WIDTH
-            score = overlap * 0.7 + width_score * 0.3
+            # 重叠长度越长越好，归一化到[0,1]，假设5米为满分
+            overlap_score = min(overlap_length / 5.0, 1.0)
+            score = overlap_score * 0.7 + width_score * 0.3
 
             if score > best_score:
                 best_score = score
@@ -557,6 +558,43 @@ def generate_centerline(wall1, wall2):
         'width': width,
         'wall_pair': (wall1, wall2)
     }
+
+
+def select_main_road(centerlines, robot_pos=np.array([0.0, 0.0])):
+    """选择机器人所在的主干道（距离机器人最近的中心线）"""
+    if len(centerlines) == 0:
+        return None
+
+    min_dist = float('inf')
+    main_centerline = None
+
+    for cl in centerlines:
+        # 计算机器人到中心线的最近距离（点到线段的距离）
+        p1 = cl['p1']
+        p2 = cl['p2']
+
+        # 线段方向向量
+        line_vec = p2 - p1
+        line_length_sq = np.dot(line_vec, line_vec)
+
+        if line_length_sq < 1e-12:
+            # 退化为点的情况
+            dist = np.linalg.norm(robot_pos - p1)
+        else:
+            # 计算投影参数 t
+            robot_vec = robot_pos - p1
+            t = np.dot(robot_vec, line_vec) / line_length_sq
+            t = np.clip(t, 0.0, 1.0)  # 限制在线段范围内
+
+            # 最近点
+            closest_point = p1 + t * line_vec
+            dist = np.linalg.norm(robot_pos - closest_point)
+
+        if dist < min_dist:
+            min_dist = dist
+            main_centerline = cl
+
+    return main_centerline
 
 
 # =========================
@@ -687,6 +725,135 @@ def detect_intersection(walls, centerline):
     return polygon, centroid, debug_info
 
 
+def detect_successor_lanes(walls, centerline, polygon, centroid, intersection_coords):
+    """检测路口的后继车道（4个方向：前、后、左、右）
+
+    Args:
+        walls: 所有墙体列表
+        centerline: 主干道中心线
+        polygon: 路口多边形
+        centroid: 路口质心
+        intersection_coords: 路口交点坐标列表
+
+    Returns:
+        successor_lanes: 过滤后的后继车道列表
+        rectangle_info: 矩形信息（用于可视化）
+    """
+    if centerline is None or polygon is None or centroid is None or len(intersection_coords) < 3:
+        return [], None
+
+    # 1. 计算中心线方向（自车方向）
+    road_dir = normalize(centerline['p2'] - centerline['p1'])
+    road_angle = np.arctan2(road_dir[1], road_dir[0])
+
+    # 2. 构建旋转矩阵（将中心线方向旋转到X轴）
+    cos_a = np.cos(-road_angle)
+    sin_a = np.sin(-road_angle)
+    R = np.array([[cos_a, -sin_a], [sin_a, cos_a]])
+
+    # 3. 旋转交点坐标到aligned坐标系
+    centered_coords = np.array(intersection_coords) - centroid
+    rotated_coords = centered_coords @ R.T
+
+    # 4. 计算AABB（轴对齐边界框 = 最小矩形）
+    x_min, y_min = rotated_coords.min(axis=0)
+    x_max, y_max = rotated_coords.max(axis=0)
+
+    # 5. 矩形的3条边的中点（在rotated坐标系）
+    # 只保留3个后继方向：前（直行）、左、右
+    # backward不需要，因为main_centerline已经代表当前车道
+    edge_centers_rotated = {
+        'forward': np.array([x_max, (y_min + y_max) / 2]),
+        'left': np.array([(x_min + x_max) / 2, y_max]),
+        'right': np.array([(x_min + x_max) / 2, y_min])
+    }
+
+    # 6. 旋转回世界坐标系
+    R_inv = R.T
+    edge_centers_world = {}
+    for direction, pt_rot in edge_centers_rotated.items():
+        pt_world = pt_rot @ R_inv.T + centroid
+        edge_centers_world[direction] = pt_world
+
+    # 7. 生成3个后继方向的车道（从路口质心向外延伸3米）
+    SUCCESSOR_LENGTH = 3.0
+    successor_lanes = []
+
+    for direction, edge_center in edge_centers_world.items():
+        lane_dir = normalize(edge_center - centroid)
+        p1 = centroid
+        p2 = centroid + lane_dir * SUCCESSOR_LENGTH
+
+        successor_lanes.append({
+            'direction': direction,
+            'p1': p1,
+            'p2': p2,
+            'lane_dir': lane_dir,
+            'edge_center': edge_center
+        })
+
+    # 8. 墙体遮挡检测
+    filtered_lanes = []
+    for lane in successor_lanes:
+        if not is_blocked_by_wall(lane, walls, centerline):
+            filtered_lanes.append(lane)
+
+    # 返回矩形信息和过滤后的车道
+    # 将矩形的4个角点转回世界坐标（用于可视化）
+    rect_corners_rotated = np.array([
+        [x_min, y_min],
+        [x_max, y_min],
+        [x_max, y_max],
+        [x_min, y_max]
+    ])
+    rect_corners_world = rect_corners_rotated @ R_inv.T + centroid
+
+    rectangle_info = {
+        'centroid': centroid,
+        'road_angle': road_angle,
+        'corners': rect_corners_world,
+        'R': R
+    }
+
+    return filtered_lanes, rectangle_info
+
+
+def is_blocked_by_wall(lane, walls, main_centerline):
+    """检测车道是否被墙体遮挡
+
+    策略：直接检查后继车道线段是否与墙体距离很近（说明被墙堵住）
+    不区分方向，所有4个方向都用同样的逻辑检查
+    """
+    BLOCKING_DISTANCE = 0.5  # 如果车道与墙体距离小于0.5米，认为被阻挡
+
+    # 获取主干道墙体ID（排除它们，因为它们是自车所在道路的边界）
+    road_wall_ids = set()
+    if main_centerline is not None:
+        wall1, wall2 = main_centerline['wall_pair']
+        road_wall_ids = {wall1['id'], wall2['id']}
+
+    # 创建车道线段
+    lane_line = LineString([lane['p1'], lane['p2']])
+
+    # 检查所有其他墙体
+    for wall in walls:
+        # 跳过主干道的墙体（它们是自车所在道路的边界）
+        if wall['id'] in road_wall_ids:
+            continue
+
+        # 创建墙体线段
+        wall_line = LineString([wall['fit']['p1'], wall['fit']['p2']])
+
+        # 计算车道线段到墙体的最短距离
+        dist = lane_line.distance(wall_line)
+
+        # 如果距离很近，说明这个方向被墙堵住了
+        if dist < BLOCKING_DISTANCE:
+            return True
+
+    return False
+
+
 # =========================
 # 4. 完整处理流程
 # =========================
@@ -727,29 +894,64 @@ def process_full_pipeline(laserscan_path):
     for wall1, wall2, dist in wall_pairs:
         cl = generate_centerline(wall1, wall2)
         centerlines.append(cl)
-        print(f"  中心线宽度: {cl['width']:.2f}m")
+        print(f"  中心线 #{len(centerlines)}: 宽度={cl['width']:.2f}m")
 
-    # 4. 交叉口识别
+    # 🔑 选择主干道（距离机器人最近的中心线）
+    main_centerline = select_main_road(centerlines, robot_pos=np.array([0.0, 0.0]))
+    if main_centerline is not None:
+        main_idx = centerlines.index(main_centerline)
+        print(f"  ✅ 选择主干道: 中心线 #{main_idx + 1} (距离机器人最近)")
+    else:
+        print(f"  ⚠️  未找到主干道")
+
+    # 4. 交叉口识别（只为主干道检测）
     print("\n【步骤4】交叉口识别")
     polygons = []
     centroids = []
     all_debug_info = []
 
-    for cl in centerlines:
-        poly, cent, debug_info = detect_intersection(walls, cl)
+    if main_centerline is not None:
+        poly, cent, debug_info = detect_intersection(walls, main_centerline)
         if poly is not None:
             polygons.append(poly)
             centroids.append(cent)
             all_debug_info.append(debug_info)
+            print(f"  ✅ 主干道检测到交叉口")
+        else:
+            print(f"  ⚠️  主干道未检测到交叉口")
+    else:
+        print(f"  ⚠️  无主干道，跳过交叉口识别")
 
-    print(f"  检测到交叉口: {len(polygons)}")
+    # 5. 后继车道检测（基于路口矩形）
+    print("\n【步骤5】后继车道检测")
+    successor_lanes = []
+    rectangle_info = None
 
-    return xy, walls, centerlines, polygons, centroids, all_debug_info, intermediate_data
+    if main_centerline is not None and len(polygons) > 0 and len(all_debug_info) > 0:
+        poly = polygons[0]
+        cent = centroids[0]
+        debug_info = all_debug_info[0]
+        intersection_coords = debug_info['intersection_coords']
+
+        successor_lanes, rectangle_info = detect_successor_lanes(
+            walls, main_centerline, poly, cent, intersection_coords
+        )
+
+        if len(successor_lanes) > 0:
+            print(f"  ✅ 检测到 {len(successor_lanes)} 条后继车道:")
+            for lane in successor_lanes:
+                print(f"     - {lane['direction']}")
+        else:
+            print(f"  ⚠️  未检测到后继车道")
+    else:
+        print(f"  ⚠️  无路口信息，跳过后继车道检测")
+
+    return xy, walls, centerlines, main_centerline, polygons, centroids, all_debug_info, intermediate_data, successor_lanes, rectangle_info
 
 
-def visualize_all(xy, walls, centerlines, polygons, centroids, all_debug_info, intermediate_data, output_path):
-    """可视化所有结果 - 4x2 完整流程图"""
-    fig, axes = plt.subplots(4, 2, figsize=(20, 28))
+def visualize_all(xy, walls, centerlines, main_centerline, polygons, centroids, all_debug_info, intermediate_data, successor_lanes, rectangle_info, output_path):
+    """可视化所有结果 - 5x2 完整流程图（新增图9：后继车道）"""
+    fig, axes = plt.subplots(5, 2, figsize=(20, 35))
 
     # 提取中间数据
     segments_points = intermediate_data['segments_points']
@@ -887,10 +1089,10 @@ def visualize_all(xy, walls, centerlines, polygons, centroids, all_debug_info, i
     if len(xy) > 0:
         ax7.scatter(xy[:, 0], xy[:, 1], c='lightgray', s=1, alpha=0.3)
 
-    # 🔑 获取道路边界墙的ID（用于区分左右墙）
+    # 🔑 获取主干道边界墙的ID（用于区分左右墙）
     road_wall_ids = set()
-    if len(centerlines) > 0:
-        wall1, wall2 = centerlines[0]['wall_pair']
+    if main_centerline is not None:
+        wall1, wall2 = main_centerline['wall_pair']
         road_wall_ids = {wall1['id'], wall2['id']}
 
     # 绘制墙体（区分左右墙）
@@ -899,13 +1101,13 @@ def visualize_all(xy, walls, centerlines, polygons, centroids, all_debug_info, i
 
         # 🎨 根据墙体类型选择颜色
         if wall['id'] in road_wall_ids:
-            # 道路边界墙：用蓝色和绿色区分
-            if len(centerlines) > 0:
-                wall1, wall2 = centerlines[0]['wall_pair']
+            # 主干道边界墙：用蓝色和绿色区分
+            if main_centerline is not None:
+                wall1, wall2 = main_centerline['wall_pair']
                 if wall['id'] == wall1['id']:
-                    color, label = 'b', 'Left Wall'
+                    color, label = 'b', 'Left Wall (Main)'
                 else:
-                    color, label = 'g', 'Right Wall'
+                    color, label = 'g', 'Right Wall (Main)'
             else:
                 color, label = 'b', 'Road Wall'
         else:
@@ -916,11 +1118,19 @@ def visualize_all(xy, walls, centerlines, polygons, centroids, all_debug_info, i
                 [fit['p1'][1], fit['p2'][1]],
                 color=color, linewidth=3, alpha=0.8, label=label if label else '')
 
-    # 绘制中心线
+    # 绘制中心线（区分主干道和其他道路）
     for i, cl in enumerate(centerlines):
-        ax7.plot([cl['p1'][0], cl['p2'][0]],
-                [cl['p1'][1], cl['p2'][1]],
-                'r--', linewidth=3, alpha=0.9, label='Centerline' if i == 0 else '')
+        if main_centerline is not None and cl is main_centerline:
+            # 主干道：红色粗虚线
+            ax7.plot([cl['p1'][0], cl['p2'][0]],
+                    [cl['p1'][1], cl['p2'][1]],
+                    'r--', linewidth=4, alpha=0.9, label='Main Road Centerline')
+        else:
+            # 其他道路：灰色细虚线
+            ax7.plot([cl['p1'][0], cl['p2'][0]],
+                    [cl['p1'][1], cl['p2'][1]],
+                    color='gray', linestyle=':', linewidth=2, alpha=0.5,
+                    label='Other Centerlines' if i == 0 and main_centerline is not None else '')
 
     ax7.plot(0, 0, 'k^', markersize=10, markeredgewidth=2, label='Robot')
     ax7.set_title(f"7. Walls + Centerlines (CL={len(centerlines)})", fontsize=12, fontweight='bold')
@@ -972,12 +1182,12 @@ def visualize_all(xy, walls, centerlines, polygons, centroids, all_debug_info, i
 
         # 🎨 根据墙体类型选择颜色（与图7一致）
         if wall['id'] in road_wall_ids:
-            if len(centerlines) > 0:
-                wall1, wall2 = centerlines[0]['wall_pair']
+            if main_centerline is not None:
+                wall1, wall2 = main_centerline['wall_pair']
                 if wall['id'] == wall1['id']:
-                    color, label = 'b', 'Left Wall'
+                    color, label = 'b', 'Left Wall (Main)'
                 else:
-                    color, label = 'g', 'Right Wall'
+                    color, label = 'g', 'Right Wall (Main)'
             else:
                 color, label = 'b', 'Road Wall'
         else:
@@ -987,11 +1197,19 @@ def visualize_all(xy, walls, centerlines, polygons, centroids, all_debug_info, i
                 [fit['p1'][1], fit['p2'][1]],
                 color=color, linewidth=3, alpha=0.8, label=label if label else '')
 
-    # 绘制中心线
+    # 绘制中心线（区分主干道和其他道路）
     for i, cl in enumerate(centerlines):
-        ax8.plot([cl['p1'][0], cl['p2'][0]],
-                [cl['p1'][1], cl['p2'][1]],
-                'r--', linewidth=3, alpha=0.9, label='Centerline' if i == 0 else '')
+        if main_centerline is not None and cl is main_centerline:
+            # 主干道：红色粗虚线
+            ax8.plot([cl['p1'][0], cl['p2'][0]],
+                    [cl['p1'][1], cl['p2'][1]],
+                    'r--', linewidth=4, alpha=0.9, label='Main Road Centerline')
+        else:
+            # 其他道路：灰色细虚线
+            ax8.plot([cl['p1'][0], cl['p2'][0]],
+                    [cl['p1'][1], cl['p2'][1]],
+                    color='gray', linestyle=':', linewidth=2, alpha=0.5,
+                    label='Other Centerlines' if i == 0 and main_centerline is not None else '')
 
     # 绘制交叉口
     for i, poly in enumerate(polygons):
@@ -1015,6 +1233,87 @@ def visualize_all(xy, walls, centerlines, polygons, centroids, all_debug_info, i
     ax8.grid(True, linestyle=':', alpha=0.4)
     ax8.legend(fontsize=8, loc='best', framealpha=0.9, ncol=2)
 
+    # ========== 第5行左：路口矩形 + 后继车道 ==========
+    ax9 = axes[4, 0]
+    if len(xy) > 0:
+        ax9.scatter(xy[:, 0], xy[:, 1], c='lightgray', s=1, alpha=0.2)
+
+    # 绘制墙体
+    for i, wall in enumerate(walls):
+        fit = wall['fit']
+        if wall['id'] in road_wall_ids:
+            if main_centerline is not None:
+                wall1, wall2 = main_centerline['wall_pair']
+                if wall['id'] == wall1['id']:
+                    color = 'b'
+                else:
+                    color = 'g'
+            else:
+                color = 'b'
+        else:
+            color = 'gray'
+        ax9.plot([fit['p1'][0], fit['p2'][0]],
+                [fit['p1'][1], fit['p2'][1]],
+                color=color, linewidth=2.5, alpha=0.7)
+
+    # 绘制主干道中心线
+    if main_centerline is not None:
+        ax9.plot([main_centerline['p1'][0], main_centerline['p2'][0]],
+                [main_centerline['p1'][1], main_centerline['p2'][1]],
+                'r--', linewidth=3, alpha=0.9, label='Main Centerline')
+
+    # 绘制路口矩形
+    if rectangle_info is not None:
+        corners = rectangle_info['corners']
+        # 闭合矩形（添加第一个点到末尾）
+        rect_x = np.append(corners[:, 0], corners[0, 0])
+        rect_y = np.append(corners[:, 1], corners[0, 1])
+        ax9.plot(rect_x, rect_y, 'purple', linestyle='--', linewidth=2.5, alpha=0.8, label='Junction Rectangle')
+        ax9.fill(rect_x, rect_y, alpha=0.15, color='purple')
+
+        # 绘制质心
+        cent = rectangle_info['centroid']
+        ax9.plot(cent[0], cent[1], 'mo', markersize=10, markeredgecolor='black',
+                markeredgewidth=1.5, label='Centroid')
+
+    # 绘制后继车道（3个方向，不同颜色）
+    if len(successor_lanes) > 0:
+        direction_colors = {
+            'forward': 'lime',
+            'left': 'yellow',
+            'right': 'orange'
+        }
+
+        for lane in successor_lanes:
+            direction = lane['direction']
+            color = direction_colors.get(direction, 'white')
+            ax9.plot([lane['p1'][0], lane['p2'][0]],
+                    [lane['p1'][1], lane['p2'][1]],
+                    color=color, linewidth=3.5, alpha=0.95,
+                    label=f"{direction.capitalize()}")
+            # 绘制箭头
+            ax9.arrow(lane['p1'][0], lane['p1'][1],
+                     (lane['p2'][0] - lane['p1'][0]) * 0.8,
+                     (lane['p2'][1] - lane['p1'][1]) * 0.8,
+                     head_width=0.3, head_length=0.2, fc=color, ec=color, alpha=0.8)
+
+    ax9.plot(0, 0, 'k^', markersize=10, markeredgewidth=2, label='Robot')
+    ax9.set_title(f"9. Junction Rectangle + Successor Lanes (N={len(successor_lanes)})",
+                 fontsize=12, fontweight='bold')
+    ax9.set_xlabel("X (m)")
+    ax9.set_ylabel("Y (m)")
+    ax9.set_xlim(-10, 10)
+    ax9.set_ylim(-10, 10)
+    ax9.set_aspect('equal', adjustable='box')
+    ax9.grid(True, linestyle=':', alpha=0.4)
+    ax9.legend(fontsize=9, loc='best', framealpha=0.9)
+
+    # ========== 第5行右：空白（预留）==========
+    ax10 = axes[4, 1]
+    ax10.axis('off')
+    ax10.text(0.5, 0.5, 'Reserved for future use', ha='center', va='center',
+             transform=ax10.transAxes, fontsize=14, color='gray', style='italic')
+
     plt.tight_layout()
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
     plt.close()
@@ -1029,12 +1328,12 @@ def main():
 
     # 完整处理流程
     input_path = os.path.join(os.path.dirname(__file__), INPUT_LASERSCAN_PATH)
-    xy, walls, centerlines, polygons, centroids, all_debug_info, intermediate_data = process_full_pipeline(input_path)
+    xy, walls, centerlines, main_centerline, polygons, centroids, all_debug_info, intermediate_data, successor_lanes, rectangle_info = process_full_pipeline(input_path)
 
     # 可视化结果
     output_filename = os.path.splitext(os.path.basename(input_path))[0] + "_complete.png"
     output_path = os.path.join(OUTPUT_DIR, output_filename)
-    visualize_all(xy, walls, centerlines, polygons, centroids, all_debug_info, intermediate_data, output_path)
+    visualize_all(xy, walls, centerlines, main_centerline, polygons, centroids, all_debug_info, intermediate_data, successor_lanes, rectangle_info, output_path)
 
     print("\n" + "=" * 70)
     print(" 处理完成!")
@@ -1043,6 +1342,7 @@ def main():
     print(f"墙体数量: {len(walls)}")
     print(f"中心线数量: {len(centerlines)}")
     print(f"交叉口数量: {len(polygons)}")
+    print(f"后继车道数量: {len(successor_lanes)}")
     print("=" * 70)
 
 

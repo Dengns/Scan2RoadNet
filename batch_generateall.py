@@ -21,20 +21,21 @@ import sys
 # 导入generateall.py中的函数
 sys.path.insert(0, os.path.dirname(__file__))
 from generateall import (
-    laserscan_to_xy, detect_walls, find_wall_pairs, generate_centerline,
+    laserscan_to_xy, detect_walls, find_wall_pairs, generate_centerline, select_main_road,
     detect_intersection, MAX_RANGE, X_LIMIT, Y_LIMIT, RDP_EPSILON, MIN_SPLIT_POINTS,
-    MIN_RDP_SEGMENT_LENGTH, PARAM_DBSCAN_EPS, ALPHA_SCALE, BETA_SCALE, GAP_THRESH
+    MIN_RDP_SEGMENT_LENGTH, PARAM_DBSCAN_EPS, ALPHA_SCALE, BETA_SCALE, GAP_THRESH,
+    MIN_OVERLAP_LENGTH
 )
 
 
 # =========================
 # 配置参数
 # =========================
-LASERSCAN_DIR = "extracted_lidar_data_code/extracted_lidar_data/laserscan_json"
-OUTPUT_DIR = "extracted_lidar_data_code/batch_all_in_one_results"
+LASERSCAN_DIR = "extracted_lidar_data_code/extracted_lidar_data/laserscan_json2"
+OUTPUT_DIR = "extracted_lidar_data_code/batch_all_in_one_results2"
 
 
-def visualize_final_only(xy, walls, centerlines, polygons, centroids, all_debug_info, output_path, frame_idx):
+def visualize_final_only(xy, walls, centerlines, main_centerline, polygons, centroids, all_debug_info, output_path, frame_idx):
     """只可视化最终结果图（图8）"""
     fig, ax = plt.subplots(figsize=(14, 14))
 
@@ -42,10 +43,10 @@ def visualize_final_only(xy, walls, centerlines, polygons, centroids, all_debug_
     if len(xy) > 0:
         ax.scatter(xy[:, 0], xy[:, 1], c='lightgray', s=1, alpha=0.3)
 
-    # 获取道路边界墙的ID
+    # 获取主干道边界墙的ID
     road_wall_ids = set()
-    if len(centerlines) > 0:
-        wall1, wall2 = centerlines[0]['wall_pair']
+    if main_centerline is not None:
+        wall1, wall2 = main_centerline['wall_pair']
         road_wall_ids = {wall1['id'], wall2['id']}
 
     # 🔑 绘制延长线和垂线（如果有调试信息）
@@ -78,18 +79,18 @@ def visualize_final_only(xy, walls, centerlines, polygons, centroids, all_debug_
                    markeredgewidth=1, label='Intersection Points' if i == 0 else '')
 
     # 绘制墙体（区分左右墙）
-    label_shown = {'Left Wall': False, 'Right Wall': False, 'Other Walls': False, 'Road Wall': False}
+    label_shown = {'Left Wall (Main)': False, 'Right Wall (Main)': False, 'Other Walls': False, 'Road Wall': False, 'Other Centerlines': False}
 
     for wall in walls:
         fit = wall['fit']
 
         if wall['id'] in road_wall_ids:
-            if len(centerlines) > 0:
-                wall1, wall2 = centerlines[0]['wall_pair']
+            if main_centerline is not None:
+                wall1, wall2 = main_centerline['wall_pair']
                 if wall['id'] == wall1['id']:
-                    color, label = 'b', 'Left Wall'
+                    color, label = 'b', 'Left Wall (Main)'
                 else:
-                    color, label = 'g', 'Right Wall'
+                    color, label = 'g', 'Right Wall (Main)'
             else:
                 color, label = 'b', 'Road Wall'
         else:
@@ -104,11 +105,22 @@ def visualize_final_only(xy, walls, centerlines, polygons, centroids, all_debug_
                [fit['p1'][1], fit['p2'][1]],
                color=color, linewidth=3, alpha=0.8, label=show_label)
 
-    # 绘制中心线
+    # 绘制中心线（区分主干道和其他道路）
     for i, cl in enumerate(centerlines):
-        ax.plot([cl['p1'][0], cl['p2'][0]],
-               [cl['p1'][1], cl['p2'][1]],
-               'r--', linewidth=3, alpha=0.9, label='Centerline' if i == 0 else '')
+        if main_centerline is not None and cl is main_centerline:
+            # 主干道：红色粗虚线
+            ax.plot([cl['p1'][0], cl['p2'][0]],
+                   [cl['p1'][1], cl['p2'][1]],
+                   'r--', linewidth=4, alpha=0.9, label='Main Road Centerline')
+        else:
+            # 其他道路：灰色细虚线
+            show_other_label = 'Other Centerlines' if not label_shown['Other Centerlines'] else ''
+            if not label_shown['Other Centerlines']:
+                label_shown['Other Centerlines'] = True
+            ax.plot([cl['p1'][0], cl['p2'][0]],
+                   [cl['p1'][1], cl['p2'][1]],
+                   color='gray', linestyle=':', linewidth=2, alpha=0.5,
+                   label=show_other_label)
 
     # 绘制交叉口
     for i, poly in enumerate(polygons):
@@ -165,6 +177,7 @@ def process_single_scan(laserscan_path, output_path, frame_idx):
         # 初始化空结果（如果后续步骤失败，就用空结果）
         walls = []
         centerlines = []
+        main_centerline = None
         polygons = []
         centroids = []
         all_debug_info = []
@@ -189,9 +202,12 @@ def process_single_scan(laserscan_path, output_path, frame_idx):
                         cl = generate_centerline(wall1, wall2)
                         centerlines.append(cl)
 
-                    # 4. 交叉口识别
-                    for cl in centerlines:
-                        poly, cent, debug_info = detect_intersection(walls, cl)
+                    # 🔑 选择主干道（距离机器人最近的中心线）
+                    main_centerline = select_main_road(centerlines, robot_pos=np.array([0.0, 0.0]))
+
+                    # 4. 交叉口识别（只为主干道检测）
+                    if main_centerline is not None:
+                        poly, cent, debug_info = detect_intersection(walls, main_centerline)
                         if poly is not None:
                             polygons.append(poly)
                             centroids.append(cent)
@@ -200,7 +216,7 @@ def process_single_scan(laserscan_path, output_path, frame_idx):
                     status_msg = f"W={len(walls)}, CL={len(centerlines)}, INT={len(polygons)}"
 
         # 5. 可视化（总是生成，即使结果为空）
-        visualize_final_only(xy, walls, centerlines, polygons, centroids, all_debug_info, output_path, frame_idx)
+        visualize_final_only(xy, walls, centerlines, main_centerline, polygons, centroids, all_debug_info, output_path, frame_idx)
 
         # 如果有错误信息，返回False；否则返回True
         success = (status_msg != "" and "No " not in status_msg)
@@ -217,14 +233,17 @@ def main():
     print("=" * 70)
 
     # 打印关键参数
-    print("\n📋 墙体检测参数:")
-    print(f"  - RDP精度: {RDP_EPSILON}m")
-    print(f"  - 最少点数: {MIN_SPLIT_POINTS}")
-    print(f"  - 最小长度: {MIN_RDP_SEGMENT_LENGTH}m")
-    print(f"  - DBSCAN eps: {PARAM_DBSCAN_EPS}")
-    print(f"  - θ缩放: {ALPHA_SCALE}")
-    print(f"  - ρ动态系数: {BETA_SCALE}")
-    print(f"  - 合并间隔: {GAP_THRESH}m")
+    print("\n📋 关键参数:")
+    print(f"  墙体检测:")
+    print(f"    - RDP精度: {RDP_EPSILON}m")
+    print(f"    - 最少点数: {MIN_SPLIT_POINTS}")
+    print(f"    - 最小长度: {MIN_RDP_SEGMENT_LENGTH}m")
+    print(f"    - DBSCAN eps: {PARAM_DBSCAN_EPS}")
+    print(f"    - θ缩放: {ALPHA_SCALE}")
+    print(f"    - ρ动态系数: {BETA_SCALE}")
+    print(f"    - 合并间隔: {GAP_THRESH}m")
+    print(f"  道路匹配:")
+    print(f"    - 最小重叠长度: {MIN_OVERLAP_LENGTH}m")
 
     # 创建输出目录
     os.makedirs(OUTPUT_DIR, exist_ok=True)
