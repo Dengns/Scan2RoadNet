@@ -20,27 +20,35 @@ sys.path.insert(0, os.path.dirname(__file__))
 # =========================
 # 配置参数
 # =========================
-# 输入文件路径
-INPUT_LASERSCAN_PATH = "extracted_lidar_data_code/extracted_lidar_data/laserscan_json2/laserscan_000093.json"
+# 运行模式：'single' 或 'batch'
+RUN_MODE = 'batch'  # 改为 'single' 可切换到单帧模式
+
+# 单帧模式配置
+INPUT_LASERSCAN_PATH = "extracted_lidar_data_code/extracted_lidar_data/laserscan_json2/laserscan_000457.json"
+
+# 批量模式配置
+INPUT_DIR = "extracted_lidar_data_code/extracted_lidar_data/laserscan_json2"
+BATCH_INTERVAL = 1  # 每N个文件处理一个
+
 # 输出目录
-OUTPUT_DIR = "extracted_lidar_data_code/all_in_one_results"
+OUTPUT_DIR = "extracted_lidar_data_code/all_in_one_results2"
 
 # 墙体检测参数
 MAX_RANGE = 50.0
 X_LIMIT = 10.0
 Y_LIMIT = 5.0
-JUMP_DIST_THRESH = 0.2
+JUMP_DIST_THRESH = 0.4
 MIN_SEGMENT_POINTS = 8
 RDP_EPSILON = 0.03
 MIN_SPLIT_POINTS = 3
 MIN_RDP_SEGMENT_LENGTH = 0.3  # RDP分割后子段最小长度（米）
 WALL_RMSE_THRESH = 0.07
-MIN_SEGMENT_LENGTH = 0.5
+MIN_SEGMENT_LENGTH = 0.3   # 构成墙体的每个线段最小长度（米）
 PARAM_DBSCAN_EPS = 0.3
 PARAM_DBSCAN_MIN_SAMPLES = 1
 ALPHA_SCALE = 0.30  # θ的缩放系数
 BETA_SCALE = 0.3    # rho的动态阈值系数
-GAP_THRESH = 1.8
+GAP_THRESH = 1.2
 MIN_WALL_LENGTH = 0.8
 MIN_SEGMENTS_PER_WALL = 0.8
 
@@ -51,7 +59,10 @@ PARALLEL_ANGLE_THRESH = 10
 MIN_OVERLAP_LENGTH = 0.5  # 最小重叠长度（米）
 
 # 交叉口识别参数
-EXTEND_LENGTH = 4.0
+EXTEND_LENGTH = 4.0             # 墙体延长线长度（米）
+SUCCESSOR_LENGTH = 4.0          # 后继车道延伸长度（米）
+BLOCKING_DISTANCE = 0.5         # 墙体遮挡判定阈值（米）
+PERPENDICULAR_ANGLE_THRESH = 30        # 垂直判定角度阈值（度）：只用与中心线夹角在60-120度的墙体
 
 
 # =========================
@@ -257,6 +268,37 @@ def segment_to_hessian(p1, p2):
     return float(theta), float(rho)
 
 
+def are_segments_collinear(seg1, seg2, distance_thresh):
+    """判断两个线段是否共线
+
+    方法：计算一个线段的端点到另一个线段所在直线的距离
+    如果距离都很小，说明共线
+    """
+    p1_1 = seg1['fit']['p1']
+    p1_2 = seg1['fit']['p2']
+    p2_1 = seg2['fit']['p1']
+    p2_2 = seg2['fit']['p2']
+
+    # 计算seg1的方向向量（用于定义直线）
+    dir1 = p1_2 - p1_1
+    norm1 = np.linalg.norm(dir1)
+    if norm1 < 1e-6:
+        return False
+    dir1 = dir1 / norm1
+
+    # 计算seg2的两个端点到seg1所在直线的距离
+    # 点到直线距离公式：|(P - P0) × dir|
+    vec_to_p2_1 = p2_1 - p1_1
+    vec_to_p2_2 = p2_2 - p1_1
+
+    # 2D叉积的绝对值
+    dist_p2_1 = abs(vec_to_p2_1[0] * dir1[1] - vec_to_p2_1[1] * dir1[0])
+    dist_p2_2 = abs(vec_to_p2_2[0] * dir1[1] - vec_to_p2_2[1] * dir1[0])
+
+    # 如果两个端点到直线的距离都很小，说明共线
+    return dist_p2_1 < distance_thresh and dist_p2_2 < distance_thresh
+
+
 def cluster_segments_in_param_space(fitted_segments, eps, min_samples, alpha, beta):
     """在 (θ, ρ, r) 参数空间对线段进行DBSCAN聚类（带角度wrap和距离自适应）"""
     if len(fitted_segments) == 0:
@@ -283,6 +325,35 @@ def cluster_segments_in_param_space(fitted_segments, eps, min_samples, alpha, be
         features[i, 0] = theta
         features[i, 1] = rho
         features[i, 2] = r
+
+    # 🔑 预处理：检查共线线段的边界跳变问题
+    THETA_BOUNDARY_THRESH = 0.15  # 边界阈值（弧度）
+    COLLINEAR_DISTANCE_THRESH = 0.2  # 共线判定阈值（米）
+
+    for i in range(n_segs):
+        for j in range(i + 1, n_segs):
+            theta_i, rho_i = features[i, 0], features[i, 1]
+            theta_j, rho_j = features[j, 0], features[j, 1]
+
+            # 检查是否在边界附近且 ρ 符号相反
+            theta_near_0 = min(theta_i, theta_j) < THETA_BOUNDARY_THRESH
+            theta_near_pi = max(theta_i, theta_j) > (np.pi - THETA_BOUNDARY_THRESH)
+
+            if (theta_near_0 or theta_near_pi) and rho_i * rho_j < 0:
+                # 可能是边界跳变，检查是否共线
+                # 获取原始线段
+                seg_i = fitted_segments[i]
+                seg_j = fitted_segments[j]
+
+                # 检查共线性：计算一个线段的端点到另一个线段的距离
+                if are_segments_collinear(seg_i, seg_j, COLLINEAR_DISTANCE_THRESH):
+                    # 共线！统一表示：将 θ 接近 π 的转换到接近 0
+                    if theta_i > np.pi / 2:
+                        features[i, 0] = theta_i - np.pi
+                        features[i, 1] = -rho_i
+                    if theta_j > np.pi / 2:
+                        features[j, 0] = theta_j - np.pi
+                        features[j, 1] = -rho_j
 
     # 使用自定义metric进行DBSCAN聚类
     # 将alpha和k_rho参数固化到metric函数中
@@ -464,51 +535,47 @@ def compute_projection_overlap(wall1, wall2):
 
 
 def find_wall_pairs(walls):
-    """找到可以配对的墙体"""
+    """找到可以配对的墙体（允许墙体被多次使用）"""
     pairs = []
-    used_walls = set()
 
+    # 🔑 改进：遍历所有可能的墙体对，不限制单次使用
     for i, wall1 in enumerate(walls):
-        if i in used_walls:
-            continue
-
-        best_match = None
-        best_score = -1
-
         for j, wall2 in enumerate(walls):
-            if i >= j or j in used_walls:
+            if i >= j:  # 避免重复配对和自己配对自己
                 continue
 
+            # 检查是否平行
             if not are_parallel(wall1, wall2, PARALLEL_ANGLE_THRESH):
                 continue
 
+            # 检查距离是否在道路宽度范围内
             dist = compute_wall_distance(wall1, wall2)
             if dist < MIN_ROAD_WIDTH or dist > MAX_ROAD_WIDTH:
                 continue
 
-            # 🔑 改进：检查绝对重叠长度（米），而不是重叠比例
+            # 检查重叠长度
             overlap_length = compute_projection_overlap(wall1, wall2)
             if overlap_length < MIN_OVERLAP_LENGTH:
                 continue
 
-            # 计算评分（使用重叠长度参与评分）
-            ideal_width = 1.5
-            width_score = 1.0 - abs(dist - ideal_width) / MAX_ROAD_WIDTH
-            # 重叠长度越长越好，归一化到[0,1]，假设5米为满分
-            overlap_score = min(overlap_length / 5.0, 1.0)
-            score = overlap_score * 0.7 + width_score * 0.3
-
-            if score > best_score:
-                best_score = score
-                best_match = (j, wall2, dist)
-
-        if best_match is not None:
-            j, wall2, dist = best_match
+            # 所有条件满足，添加配对
             pairs.append((wall1, wall2, dist))
-            used_walls.add(i)
-            used_walls.add(j)
 
-    return pairs
+    # 🔑 按重叠长度排序，优先使用重叠长度更长的配对
+    pairs_with_score = []
+    for wall1, wall2, dist in pairs:
+        overlap_length = compute_projection_overlap(wall1, wall2)
+        ideal_width = 1.5
+        width_score = 1.0 - abs(dist - ideal_width) / MAX_ROAD_WIDTH
+        overlap_score = min(overlap_length / 5.0, 1.0)
+        score = overlap_score * 0.7 + width_score * 0.3
+        pairs_with_score.append((wall1, wall2, dist, score))
+
+    # 按得分降序排序
+    pairs_with_score.sort(key=lambda x: x[3], reverse=True)
+
+    # 返回排序后的配对（去掉得分）
+    return [(w1, w2, d) for w1, w2, d, _ in pairs_with_score]
 
 
 def generate_centerline(wall1, wall2):
@@ -663,6 +730,21 @@ def detect_intersection(walls, centerline):
     self_walls = [wall1, wall2]
     other_walls = [w for w in walls if w['id'] not in self_wall_ids]
 
+    # 🔑 过滤：只保留与中心线垂直的墙体
+    # 计算中心线方向
+    road_dir = normalize(centerline['p2'] - centerline['p1'])
+
+    filtered_other_walls = []
+    for wall in other_walls:
+        wall_dir = normalize(wall['fit']['p2'] - wall['fit']['p1'])
+        # 计算夹角（度）
+        dot = np.abs(np.dot(wall_dir, road_dir))
+        angle_deg = np.degrees(np.arccos(np.clip(dot, 0.0, 1.0)))
+
+        # 只保留接近垂直的墙体（60-120度之间）
+        if 90 - PERPENDICULAR_ANGLE_THRESH <= angle_deg <= 90 + PERPENDICULAR_ANGLE_THRESH:
+            filtered_other_walls.append(wall)
+
     # 延长墙体
     self_wall_extended = []
     for wall in self_walls:
@@ -670,7 +752,7 @@ def detect_intersection(walls, centerline):
         self_wall_extended.append([p1_ext, p2_ext])
 
     other_wall_extended = []
-    for wall in other_walls:
+    for wall in filtered_other_walls:
         p1_ext, p2_ext = extend_line(wall['fit']['p1'], wall['fit']['p2'], EXTEND_LENGTH)
         other_wall_extended.append([p1_ext, p2_ext])
 
@@ -759,30 +841,35 @@ def detect_successor_lanes(walls, centerline, polygon, centroid, intersection_co
     x_min, y_min = rotated_coords.min(axis=0)
     x_max, y_max = rotated_coords.max(axis=0)
 
-    # 5. 矩形的3条边的中点（在rotated坐标系）
-    # 只保留3个后继方向：前（直行）、左、右
-    # backward不需要，因为main_centerline已经代表当前车道
-    edge_centers_rotated = {
-        'forward': np.array([x_max, (y_min + y_max) / 2]),
-        'left': np.array([(x_min + x_max) / 2, y_max]),
-        'right': np.array([(x_min + x_max) / 2, y_min])
+    # 5. 生成3个后继方向的车道（从路口质心向外延伸）
+    # 在旋转坐标系中定义标准方向，确保left和right垂直于forward
+    successor_lanes = []
+    R_inv = R.T
+
+    # 定义3个标准方向（在旋转坐标系中）
+    directions_rotated = {
+        'forward': np.array([1.0, 0.0]),   # X正方向
+        'left': np.array([0.0, 1.0]),      # Y正方向（垂直于forward）
+        'right': np.array([0.0, -1.0])     # Y负方向（垂直于forward）
     }
 
-    # 6. 旋转回世界坐标系
-    R_inv = R.T
-    edge_centers_world = {}
-    for direction, pt_rot in edge_centers_rotated.items():
-        pt_world = pt_rot @ R_inv.T + centroid
-        edge_centers_world[direction] = pt_world
+    for direction, dir_vec_rotated in directions_rotated.items():
+        # 旋转回世界坐标系
+        lane_dir = normalize(dir_vec_rotated @ R_inv.T)
 
-    # 7. 生成3个后继方向的车道（从路口质心向外延伸3米）
-    SUCCESSOR_LENGTH = 3.0
-    successor_lanes = []
-
-    for direction, edge_center in edge_centers_world.items():
-        lane_dir = normalize(edge_center - centroid)
+        # 生成车道线段
         p1 = centroid
         p2 = centroid + lane_dir * SUCCESSOR_LENGTH
+
+        # 计算边界中点（用于可视化）
+        if direction == 'forward':
+            edge_center_rot = np.array([x_max, (y_min + y_max) / 2])
+        elif direction == 'left':
+            edge_center_rot = np.array([(x_min + x_max) / 2, y_max])
+        else:  # right
+            edge_center_rot = np.array([(x_min + x_max) / 2, y_min])
+
+        edge_center = edge_center_rot @ R_inv.T + centroid
 
         successor_lanes.append({
             'direction': direction,
@@ -822,10 +909,8 @@ def is_blocked_by_wall(lane, walls, main_centerline):
     """检测车道是否被墙体遮挡
 
     策略：直接检查后继车道线段是否与墙体距离很近（说明被墙堵住）
-    不区分方向，所有4个方向都用同样的逻辑检查
+    不区分方向，所有3个方向都用同样的逻辑检查
     """
-    BLOCKING_DISTANCE = 0.5  # 如果车道与墙体距离小于0.5米，认为被阻挡
-
     # 获取主干道墙体ID（排除它们，因为它们是自车所在道路的边界）
     road_wall_ids = set()
     if main_centerline is not None:
@@ -899,8 +984,12 @@ def process_full_pipeline(laserscan_path):
     # 🔑 选择主干道（距离机器人最近的中心线）
     main_centerline = select_main_road(centerlines, robot_pos=np.array([0.0, 0.0]))
     if main_centerline is not None:
-        main_idx = centerlines.index(main_centerline)
-        print(f"  ✅ 选择主干道: 中心线 #{main_idx + 1} (距离机器人最近)")
+        # 使用身份比较（is）而不是值比较（==）来查找索引
+        main_idx = next((i for i, cl in enumerate(centerlines) if cl is main_centerline), None)
+        if main_idx is not None:
+            print(f"  ✅ 选择主干道: 中心线 #{main_idx + 1} (距离机器人最近)")
+        else:
+            print(f"  ⚠️  找到主干道但无法确定索引")
     else:
         print(f"  ⚠️  未找到主干道")
 
@@ -1321,8 +1410,66 @@ def visualize_all(xy, walls, centerlines, main_centerline, polygons, centroids, 
     print(f"\n✅ 可视化结果已保存: {output_path}")
 
 
-def main():
-    """主函数"""
+def batch_process():
+    """批量处理模式：处理目录中的所有JSON文件，每BATCH_INTERVAL个取一个"""
+    print("=" * 70)
+    print(" 批量处理模式")
+    print("=" * 70)
+
+    # 确保输出目录存在
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    # 获取目录中所有JSON文件
+    input_dir_abs = os.path.join(os.path.dirname(__file__), INPUT_DIR)
+    json_files = sorted([f for f in os.listdir(input_dir_abs) if f.endswith('.json')])
+
+    print(f"输入目录: {input_dir_abs}")
+    print(f"找到 {len(json_files)} 个JSON文件")
+    print(f"处理间隔: 每 {BATCH_INTERVAL} 个文件处理一个")
+
+    # 每BATCH_INTERVAL个取一个
+    selected_files = json_files[::BATCH_INTERVAL]
+    print(f"将处理 {len(selected_files)} 个文件")
+    print("=" * 70)
+
+    success_count = 0
+    fail_count = 0
+
+    for idx, filename in enumerate(selected_files):
+        print(f"\n[{idx + 1}/{len(selected_files)}] 处理: {filename}")
+
+        try:
+            # 完整处理流程
+            input_path = os.path.join(input_dir_abs, filename)
+            xy, walls, centerlines, main_centerline, polygons, centroids, all_debug_info, intermediate_data, successor_lanes, rectangle_info = process_full_pipeline(input_path)
+
+            # 可视化结果
+            output_filename = os.path.splitext(filename)[0] + "_complete.png"
+            output_path = os.path.join(OUTPUT_DIR, output_filename)
+            visualize_all(xy, walls, centerlines, main_centerline, polygons, centroids, all_debug_info, intermediate_data, successor_lanes, rectangle_info, output_path)
+
+            success_count += 1
+            print(f"  ✅ 成功: {output_filename}")
+
+        except Exception as e:
+            fail_count += 1
+            print(f"  ❌ 失败: {str(e)}")
+
+    print("\n" + "=" * 70)
+    print(" 批量处理完成!")
+    print("=" * 70)
+    print(f"成功: {success_count} 个")
+    print(f"失败: {fail_count} 个")
+    print(f"输出目录: {OUTPUT_DIR}")
+    print("=" * 70)
+
+
+def single_process():
+    """单帧处理模式：处理单个JSON文件"""
+    print("=" * 70)
+    print(" 单帧处理模式")
+    print("=" * 70)
+
     # 确保输出目录存在
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -1344,6 +1491,17 @@ def main():
     print(f"交叉口数量: {len(polygons)}")
     print(f"后继车道数量: {len(successor_lanes)}")
     print("=" * 70)
+
+
+def main():
+    """主函数：根据RUN_MODE选择单帧或批量处理"""
+    if RUN_MODE == 'batch':
+        batch_process()
+    elif RUN_MODE == 'single':
+        single_process()
+    else:
+        print(f"错误：未知的运行模式 '{RUN_MODE}'")
+        print("请设置 RUN_MODE 为 'single' 或 'batch'")
 
 
 if __name__ == "__main__":
